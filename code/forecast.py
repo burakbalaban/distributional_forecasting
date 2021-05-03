@@ -425,6 +425,17 @@ def get_forecast_AR(
 
 
 def get_forecast_QRA(qra_df, qra_range, forecast_dates):
+    """Function to get Quantile Regression Averaging Forecasts from point
+    forecasts of different models.
+    Args:
+        qra_df (pd.DataFrame): should include point forecasts of individual models
+            as well as observed prices in column named as "Price_MWh".
+        qra_range (array-like): quantiles to forecast.
+        forecast_dates (tuple): dates to forecast, it should have (start date,
+            end date) structure. Dates can be str or datetime-like.
+    Returns:
+        (pd.DataFrame): string columns from qra_range.
+    """
     training_end = (pd.Timestamp(forecast_dates[0]) - pd.Timedelta(24, unit='h')).strftime('%x')
 
     train_qra_df = qra_df.loc[:training_end].copy()
