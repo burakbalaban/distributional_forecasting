@@ -52,9 +52,8 @@ holiday_half_day += [
 
 # Function for creating a holiday column with 0 and 1 values
 get_holiday = lambda df: df.assign(
-    weekend = df.index.to_series().apply(lambda x: x.dayofweek > 4),
     holiday_full_day = np.isin(df.index.date, holiday_national),
     holiday_half_day = np.isin(df.index.date, holiday_half_day) & (df.index.hour > 12),
-    Holiday = lambda df: (df.weekend | df.holiday_full_day | df.holiday_half_day).astype(int)
+    Holiday = lambda df: (df.holiday_full_day | df.holiday_half_day).astype(int)
 ) \
-.drop(columns=['weekend', 'holiday_full_day', 'holiday_half_day'])
+.drop(columns=['holiday_full_day', 'holiday_half_day'])
