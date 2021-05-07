@@ -284,7 +284,7 @@ def winkler_score(percentile_df, realized, PI):
 
 
 def DM_test(model1_score, model2_score, alpha, two_sided=False):
-    """Function for one-sided Diebold-Mariano test.
+    """Function to conduct Diebold-Mariano test.
     Args:
         model1_score (pd.DataFrame): df including scores of model1
             should have multiindex; level 0 as hours (0,23)
