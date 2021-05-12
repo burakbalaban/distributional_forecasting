@@ -307,9 +307,9 @@ def DM_test(model1_score, model2_score, alpha, two_sided=False):
     # two sided function
     def dm_test_twosided(x):
         if x>stats.norm.ppf(1-alpha/2):
-            return 1
-        elif x<stats.norm.ppf(alpha/2):
             return -1
+        elif x<stats.norm.ppf(alpha/2):
+            return 1
         else:
             return 0
     # choose function to run
