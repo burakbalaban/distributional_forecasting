@@ -4,8 +4,9 @@ import numpy as np
 from collections.abc import Sequence
 from scipy import stats
 from statsmodels.tsa.arima.model import ARIMA
-from sklearn.linear_model import Lasso
+from sklearn.linear_model import LassoLarsIC
 from statsmodels.regression.quantile_regression import QuantReg
+from pmdarima import auto_arima
 
 """Function for getting hourly seperated indices."""
 get_hourly_df = lambda df, column: df.groupby(df.index.hour)[column].apply(
@@ -42,7 +43,7 @@ def get_naive_forecast(price_df, forecast_dates):
         freq='D',
         tz=price_df.index.tzinfo
     )
-
+    PI_auto_ar_df = pd.DataFrame()
     PI_historical_df = pd.DataFrame()
     for forecast_day in PI_construction_dates:
         # dates to utilize
@@ -62,7 +63,7 @@ def get_naive_forecast(price_df, forecast_dates):
                 right_index=True,
                 how='left'
             ).assign(
-                diff = lambda df: df['Naive_forecast'] - df['Price_MWh']
+                diff = lambda df: df['Price_MWh'] - df['Naive_forecast']
             )['diff'].add(point_forecast).to_numpy()
             # add distribution to general df
             PI_historical_df = pd.concat([
@@ -72,8 +73,26 @@ def get_naive_forecast(price_df, forecast_dates):
                     index=[forecast_index]
                 )
             ])
+            # Auto Arima
+            reg_auto = auto_arima(
+                hourly_realized.loc[hour].truncate(first_day, end_day),
+                start_p=1,
+                max_p=14,
+                start_q=0,
+                max_q=0,
+            )
+            point_forecast_ar = reg_auto.predict(n_periods=1)
+            temp_ar_df = pd.DataFrame(
+                point_forecast_ar,
+                index=[forecast_index],
+                columns=['Auto_AR_Forecast']
+            ) \
+            .assign(
+                PI_historical= [ reg_auto.resid() + point_forecast_ar ]
+            )
+            PI_auto_ar_df = pd.concat([PI_auto_ar_df, temp_ar_df])
 
-    return price_df_naive.assign(PI_historical = PI_historical_df).dropna()
+    return price_df_naive.assign(PI_historical = PI_historical_df).dropna(), PI_auto_ar_df
 
 
 def add_price_lags(df, lags):
@@ -153,11 +172,12 @@ def get_mARX_cols(df):
     Returns:
         (pd.DataFrame): df with added columns e.g., Monday_Price_MWh_l1
     """
+    df_ = df.copy()
     for day in ['Saturday', 'Sunday', 'Monday']:
-        df[f"{day}_Price_MWh_l1"] = df[day].multiply(df.Price_MWh_l1)
-
-    return df.assign(
-        Price_MWh_l1 = df.mask((df.Saturday==1) | (df.Sunday==1) | (df.Monday==1),0)
+        df_[f"{day}_Price_MWh_l1"] = df_[day].multiply(df_.Price_MWh_l1)
+    df_['Monday_Price_MWh_l3'] = df_['Monday'].multiply(df_.Price_MWh_l1.shift(2))
+    return df_.assign(
+        Price_MWh_l1 = df_.mask((df_.Saturday==1) | (df_.Sunday==1) | (df_.Monday==1),0)
     )
 
 
@@ -188,9 +208,13 @@ def bootstrap_exogs(input_matrix, model_type, lags, prices_new, number_of_exogs,
             return np.concatenate((exogs, np.zeros(len(exogs))))
         else: # if above threshold
             return np.concatenate((np.zeros(len(exogs)), exogs))
-    elif model_type=='mAR':
+    elif model_type=='mAR': # if the model is multi-day AR
+        dummy_lag = input_matrix[loop_index, number_of_exogs-2:number_of_exogs+1] * prices_new[-1]
+        mon3_dummy_lag = input_matrix[loop_index, number_of_exogs] * prices_new[-3:-2]
+        if not np.sum(dummy_lag) == 0:
+            exogs[number_of_exogs] = 0
         return np.concatenate(
-            (exogs, input_matrix[loop_index,number_of_exogs+len(lags)+1:])
+            (exogs, dummy_lag, mon3_dummy_lag)
         )
     elif model_type=='AR': # if model is AR
         return exogs
@@ -236,7 +260,7 @@ def get_forecast_by_method(method, df, forecast_exogs, lasso_args):
         df (pd.DataFrame): df including endogenous and exogenous variables,
             endogenous variable should be called Price_MWh.
         forecast_exogs (pd.Series): exogenous variables to use in forecasting
-        lasso_args (dict): args for sklearn.linear_model.Lasso
+        lasso_args (dict): args for sklearn.linear_model.LassoLarsIC
     Returns:
         model (statsmodels.tsa.arima.model.ARIMAResultsWrapper or
             sklearn.linear_model._coordinate_descent.Lasso): model of interest
@@ -253,7 +277,7 @@ def get_forecast_by_method(method, df, forecast_exogs, lasso_args):
         model.params = model.params[:-1] # exclude sigma^2 - GARCH
 
     elif method.upper() == 'LASSO':
-        model = Lasso(**lasso_args).fit(
+        model = LassoLarsIC(**lasso_args).fit(
             y=df['Price_MWh'],
             X=df.drop('Price_MWh', 1)
         )
@@ -265,6 +289,7 @@ def get_forecast_by_method(method, df, forecast_exogs, lasso_args):
             df.Price_MWh, model.predict(df.drop('Price_MWh', 1))
         )
         model.params = np.insert(model.coef_, 0, model.intercept_)
+        model.aic = model.aicc = model.bic = model.criterion_.min()
     else:
         raise NotImplementedError('Specified model not implemented.')
 
@@ -327,7 +352,7 @@ def get_PI_bootstrap(
             new_sub_train_df = add_price_lags(new_sub_train_df_raw, lags).combine_first(sub_train_df)
             if model_type=='mAR':
                 # add mARX columns
-                new_sub_train_df = get_mARX_cols(new_sub_train_df)
+                new_sub_train_df = get_mARX_cols(new_sub_train_df).combine_first(sub_train_df)
 
         _, new_forecast = get_forecast_by_method(
             method, new_sub_train_df, forecast_exogs.loc[hour], lasso_args
@@ -341,7 +366,7 @@ def get_PI_bootstrap(
 def get_forecast_AR(
     main_df, price_df, lags, forecast_dates,
     model_type='AR', method='ARIMA',
-    lasso_args={'fit_intercept':True, 'selection':'random'},
+    lasso_args={'criterion':'aic','fit_intercept':True, 'normalize':False},
     PI_calculate=False, bootstrap_B=200
 ):
     """Function to get point and distributional forecasts using Autoregressive models.
@@ -452,7 +477,10 @@ def get_forecast_AR(
                         threshold_ind_list=threshold_ind_list,
                         method=method,
                         lasso_args=lasso_args
-                    )
+                    ),
+                    model_aic = model.aic,
+                    model_aicc = model.aicc,
+                    model_bic = model.bic,
                 )
             forecast_df = pd.concat([forecast_df,temp_forecast_df])
 
