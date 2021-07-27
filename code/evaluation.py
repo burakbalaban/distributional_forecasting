@@ -3,6 +3,7 @@ import pandas as pd
 import numpy as np
 from collections.abc import Sequence
 from scipy import stats
+import matplotlib.pyplot as plt
 
 """Function for getting hourly seperated indices."""
 get_hourly_df = lambda df, column: df.groupby(df.index.hour)[column].apply(
@@ -28,8 +29,36 @@ def get_PI_from_distribution(distribution_series, return_negative_values=True, p
     return percentile_df
 
 
+def get_PI_percentiles(df, percentiles=np.array([5, 25, 50, 75, 95])):
+    """Function to get prediction interval percentiles.
+    This is a wrapper function of get_PI_from_distribution.
+    Args:
+        df (pd.DataFrame): df to get distributions from
+        percentiles (list-like): percentiles to obtain
+    Returns:
+        (pd.DataFrame) different methods as MultiIndex columns with percentiles
+    """
+
+    df_ = df.filter(regex='^PI.*(l|p)$')
+    PI_dict = {col: get_PI_from_distribution(
+            df_[col],
+            percentiles=percentiles
+        )
+     for col in df_.columns
+    }
+    PI_dist_df = df.Resid_variance.apply(
+        lambda x: stats.norm.ppf(percentiles/100, scale=x)
+    ) \
+    .apply(pd.Series)\
+    .add(df.Forecast_added, axis=0)
+    PI_dist_df.columns = (percentiles / 100).round(2).astype(str)
+    PI_dict.update({'PI_distributional':PI_dist_df})
+
+    return pd.concat(PI_dict.values(), axis=1, keys=PI_dict.keys())
+
+
 def get_coverage_indicators(percentile_df, realized, PI):
-    """(Nested) Function to get coverage indicators, i.e., 1 if realized value is in the
+    """Function to get coverage indicators, i.e., 1 if realized value is in the
     prediction intervals, 0 otherwise.
     Args:
         percentile_df (pd.DataFrame): df including prediction quantiles.
@@ -94,9 +123,11 @@ def calculate_Ind_LR_score(n_00, n_10, n_01, n_11):
     Returns:
         (float): Independence Likelihood Ratio.
     """
+    fix = lambda x: x - 10**-15 if x == 1 else x
     total = n_00+n_10+n_01+n_11
     hit_pct = (n_01+n_11)/total
     p_01, p_11 = n_01 / (n_00+n_01), n_11 / (n_10+n_11)
+    hit_pct, p_01, p_11 = fix(hit_pct), fix(p_01), fix(p_11)
     nominator = (n_00+n_01)*np.log(1-hit_pct) + (n_01+n_11)*np.log(hit_pct)
     denominator = n_00*np.log(1-p_01) + n_01*np.log(p_01) + n_10*np.log(1-p_11) + n_11*np.log(p_11)
     return 2*(-nominator+denominator)
@@ -119,6 +150,8 @@ def Indepence_LR_score(hourly_cov_ind_df, lag):
             transition = lambda df: df.lagged_values.astype(int).astype(str) + df.Cov_ind.astype(int).astype(str)
         ).groupby('transition').Cov_ind.count()
     )
+    if not isinstance(count_df, pd.DataFrame):
+        count_df = count_df.to_frame().unstack().fillna(0).droplevel(0, axis=1)
     return count_df.apply(
         lambda x: calculate_Ind_LR_score(
             n_00=x['00'],
@@ -317,5 +350,46 @@ def DM_test(model1_score, model2_score, alpha, two_sided=False):
     return merged_df['m1'].sub(merged_df['m2']) \
         .groupby(level=0).apply(
             lambda hour: np.sqrt(len(hour)) * (np.mean(hour) / np.std(hour))
+            if np.std(hour)>0 else 0
         ) \
         .apply(function_to_run).to_frame('DM-decision')
+
+
+def plot_coverage(percentile_df, price_df, title, lag, figsize, savefig, cov_type='UC'):
+    Coverage_LR_Scores_50 = Christoffersen_scores(
+        percentile_df=percentile_df.dropna(),
+        realized=price_df,
+        PI=0.5,
+        lags=lag
+    )
+    Coverage_LR_Scores_90 = Christoffersen_scores(
+        percentile_df=percentile_df,
+        realized=price_df,
+        PI=0.9,
+        lags=lag
+    )
+    fig, ax = plt.subplots(figsize=figsize)
+    if cov_type=='UC':
+
+        df_90 = Coverage_LR_Scores_90.UC_LR.apply(lambda x: 20 if x>20 else x).reset_index()
+        df_50 = Coverage_LR_Scores_50.UC_LR.apply(lambda x: 20 if x>20 else x).reset_index()
+        plt.scatter(x=df_90.index, y=df_90.UC_LR, facecolors='none', edgecolors='blue', label='90% PI', marker="^")
+        plt.scatter(x=df_50.index, y=df_50.UC_LR, facecolors='none', edgecolors='red', label='50% PI')
+        ax.axhline(y=stats.chi2.ppf(0.99,df=1))
+        ax.axhline(y=stats.chi2.ppf(0.95,df=1), ls='--')
+
+    elif cov_type=='CC':
+        df_90 = Coverage_LR_Scores_90[f'CC_LR_lag{lag}'].apply(lambda x: 20 if x>20 else x).reset_index()
+        df_50 = Coverage_LR_Scores_50[f'CC_LR_lag{lag}'].apply(lambda x: 20 if x>20 else x).reset_index()
+        plt.scatter(x=df_90.index, y=df_90[f'CC_LR_lag{lag}'], facecolors='none', edgecolors='blue', label='90% PI', marker="^")
+        plt.scatter(x=df_50.index, y=df_50[f'CC_LR_lag{lag}'], facecolors='none', edgecolors='red', label='50% PI')
+        ax.axhline(y=stats.chi2.ppf(0.99,df=2))
+        ax.axhline(y=stats.chi2.ppf(0.95,df=2), ls='--')
+
+    plt.yticks([0, 10, 20])
+    plt.xticks([0,4,8,12,16,20,24])
+    title_suffix = "" if cov_type == 'UC' else f'_{lag}'
+    plt.ylabel("$LR_{"+cov_type +"}$")
+    plt.title(title)
+    fig.savefig(savefig)
+    plt.close(fig)

@@ -3,7 +3,8 @@ import pandas as pd
 import numpy as np
 from collections.abc import Sequence
 from scipy import stats
-from statsmodels.tsa.arima.model import ARIMA
+from statsmodels.regression.linear_model import OLS
+from statsmodels.tools.tools import add_constant
 from sklearn.linear_model import LassoLarsIC
 from statsmodels.regression.quantile_regression import QuantReg
 from pmdarima import auto_arima
@@ -253,43 +254,41 @@ def bootstrap_new_prices(input_matrix, beta_matrix, lags, res, model_type, numbe
 
 def get_forecast_by_method(method, df, forecast_exogs, lasso_args):
     """Function to train a model and get a one-step ahead forecast.
-    Currently two options are available; arima with yule_walker equations and
-    lasso.
+    Currently two options are available; OLS and Lasso.
     Args:
-        method (str): 'ARIMA' or 'LASSO'
+        method (str): 'OLS' or 'LASSO'
         df (pd.DataFrame): df including endogenous and exogenous variables,
             endogenous variable should be called Price_MWh.
         forecast_exogs (pd.Series): exogenous variables to use in forecasting
         lasso_args (dict): args for sklearn.linear_model.LassoLarsIC
     Returns:
-        model (statsmodels.tsa.arima.model.ARIMAResultsWrapper or
+        model (statsmodels.regression.linear_model.RegressionResultsWrapper or
             sklearn.linear_model._coordinate_descent.Lasso): model of interest
         forecast (np.array): 1-D array with one-step ahead forecast
     """
 
-    if method.upper() == 'ARIMA':
-        model = ARIMA(
+    if method.upper() == 'OLS':
+        model = OLS(
             endog=df.Price_MWh,
-            exog=df.drop('Price_MWh',1),
-        ).fit(method='yule_walker')
+            exog=add_constant(df.drop('Price_MWh',1)),
+        ).fit()
 
-        forecast = model.forecast(exog=forecast_exogs).to_numpy()
-        model.params = model.params[:-1] # exclude sigma^2 - GARCH
+        forecast = model.predict(exog=np.insert(forecast_exogs,0,1))
 
     elif method.upper() == 'LASSO':
         model = LassoLarsIC(**lasso_args).fit(
             y=df['Price_MWh'],
             X=df.drop('Price_MWh', 1)
         )
-        if isinstance(forecast_exogs, pd.Series):
-            forecast_exogs = forecast_exogs.values.reshape(1,-1)
+        # if isinstance(forecast_exogs, pd.Series):
+        #     forecast_exogs = forecast_exogs.values.reshape(1,-1)
 
         forecast = model.predict(X=forecast_exogs)
         model.resid = np.subtract(
             df.Price_MWh, model.predict(df.drop('Price_MWh', 1))
         )
         model.params = np.insert(model.coef_, 0, model.intercept_)
-        model.aic = model.aicc = model.bic = model.criterion_.min()
+        model.aic = model.bic = model.criterion_.min()
     else:
         raise NotImplementedError('Specified model not implemented.')
 
@@ -355,7 +354,7 @@ def get_PI_bootstrap(
                 new_sub_train_df = get_mARX_cols(new_sub_train_df).combine_first(sub_train_df)
 
         _, new_forecast = get_forecast_by_method(
-            method, new_sub_train_df, forecast_exogs.loc[hour], lasso_args
+            method, new_sub_train_df, forecast_exogs.loc[hour].values.reshape(1,-1), lasso_args
         )
 
         PI_bootstrap.append(new_forecast[0])
@@ -365,7 +364,7 @@ def get_PI_bootstrap(
 
 def get_forecast_AR(
     main_df, price_df, lags, forecast_dates,
-    model_type='AR', method='ARIMA',
+    model_type='AR', method='OLS',
     lasso_args={'criterion':'aic','fit_intercept':True, 'normalize':False},
     PI_calculate=False, bootstrap_B=200
 ):
@@ -385,8 +384,8 @@ def get_forecast_AR(
             Threshold Autoregressive models. This function adds zeros
             depending on the threshold value if model is "TAR".
             default is 'AR'.
-        method (str): 'ARIMA' for default Autoregressive models, 'Lasso' for
-            regularized coefficients in the model. Default is Arima.
+        method (str): 'OLS' for default Autoregressive models, 'Lasso' for
+            regularized coefficients in the model. Default is ols.
         lasso_args (dict): args for sklearn.linear_model.Lasso
         PI_calculate (bool): If True also includes distributional forecasts.
         bootstrap_B (int): bootstrap times count, default is 200.
@@ -409,25 +408,25 @@ def get_forecast_AR(
         )
     PI_construction_dates.freq=None
     number_of_exogs = len(main_df.drop('Price_MWh', axis=1).columns)
+    # add explanatory variables
+    if model_type=='TAR':
+        main_df_w_threshold_ind = add_threshold_ind_col(main_df, price_df)
+        main_df_w_lags = add_price_lags(main_df_w_threshold_ind, lags)
+        full_df_w_exogs = get_threshold_cols(main_df_w_lags)
+        threshold_ind_df = main_df_w_lags.threshold_ind.copy()
+    elif model_type=='AR':
+        full_df_w_exogs = add_price_lags(main_df, lags)
+        main_df_w_lags = None
+    elif model_type=='mAR':
+        main_df_w_lags = add_price_lags(main_df, lags)
+        full_df_w_exogs = get_mARX_cols(main_df_w_lags)
+
+
     forecast_df = pd.DataFrame()
     for forecast_day in PI_construction_dates:
         # dates to utilize
         first_day = forecast_day - pd.Timedelta(52*7, unit='D')
         end_day = forecast_day - pd.Timedelta(1, unit='H')
-
-        # add explanatory variables
-        if model_type=='TAR':
-            main_df_w_threshold_ind = add_threshold_ind_col(main_df, price_df)
-            main_df_w_lags = add_price_lags(main_df_w_threshold_ind, lags)
-            full_df_w_exogs = get_threshold_cols(main_df_w_lags)
-            threshold_ind_df = main_df_w_lags.threshold_ind.copy()
-        elif model_type=='AR':
-            full_df_w_exogs = add_price_lags(main_df, lags)
-            main_df_w_lags = None
-        elif model_type=='mAR':
-            main_df_w_lags = add_price_lags(main_df, lags)
-            full_df_w_exogs = get_mARX_cols(main_df_w_lags)
-
 
         # get training dataframe for each hour
         train_df = full_df_w_exogs.groupby(level=0).apply(
@@ -451,7 +450,7 @@ def get_forecast_AR(
                 threshold_ind_list = None
 
             model, forecast = get_forecast_by_method(
-                method, sub_train_df, forecast_exogs.loc[hour], lasso_args
+                method, sub_train_df, forecast_exogs.loc[hour].values.reshape(1,-1), lasso_args
             )
 
             temp_forecast_df = pd.Series(forecast).to_frame('Forecast')
@@ -479,7 +478,6 @@ def get_forecast_AR(
                         lasso_args=lasso_args
                     ),
                     model_aic = model.aic,
-                    model_aicc = model.aicc,
                     model_bic = model.bic,
                 )
             forecast_df = pd.concat([forecast_df,temp_forecast_df])
@@ -606,16 +604,16 @@ def PI_combinations(models, PI, beta):
         PI_ExteriorTrimming_df = pd.concat([PI_trimming_upper[bounds[0]], PI_trimming_lower[bounds[1]]], axis=1)
 
         # Probability averaging of endpoints and simple averaging of midpoints
-        PI_PM = pd.concat(models, axis=1)[bounds].mean(axis=1) \
-            .apply(lambda x: stats.norm.ppf(q=bounds.astype(float), loc=x)) \
-            .apply(pd.Series).rename(columns={0:bounds[0], 1:bounds[1]})
+        # PI_PM = pd.concat(models, axis=1)[bounds].mean(axis=1) \
+        #     .apply(lambda x: stats.norm.ppf(q=bounds.astype(float), loc=x)) \
+        #     .apply(pd.Series).rename(columns={0:bounds[0], 1:bounds[1]})
         # combine
         temp_df = pd.concat([
             PI_envelope_df,
             PI_InteriorTrimming_df,
             PI_ExteriorTrimming_df,
-            PI_PM,
-        ], axis=1, keys=['Envelope', 'IntTrim', 'ExtTrim', 'PM'])
+            # PI_PM,
+        ], axis=1, keys=['Envelope', 'IntTrim', 'ExtTrim'])
         return_df = pd.concat([return_df, temp_df], axis=1)
 
     return return_df
