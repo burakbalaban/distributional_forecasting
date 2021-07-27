@@ -1,4 +1,5 @@
-# distributional_forecasting
+# Distributional Forecasting in Electricity Markets: Prediction Interval Averaging vs QRA
+
 This notebook includes suplementary data and code for master's thesis "Distributional Forecasting in Electricity Markets: Prediction Interval Averaging vs QRA".
 We use Turkish day-ahead electricity prices to test whether prediction interval combinations can outperform Quantile Regression Averaging (QRA).
 While QRA solely uses point forecasts to generate distributional forecast, PI combinations are gathered from different models including Autoregressive (ARX), multi-day Autoregressive and threshold autoregressive (TARX).
